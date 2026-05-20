@@ -1,0 +1,981 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DeerOceanBall</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #050914;
+      --panel: rgba(7, 13, 28, 0.72);
+      --line: rgba(180, 220, 255, 0.24);
+      --text: rgba(238, 247, 255, 0.92);
+      --muted: rgba(195, 215, 236, 0.68);
+      --cyan: #6bd3ff;
+      --gold: #ffe66f;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: radial-gradient(circle at 50% 48%, #0d1730 0%, var(--bg) 58%, #02050c 100%);
+      font-family: Inter, "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      color: var(--text);
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+
+    .hud {
+      position: fixed;
+      inset: 22px 24px auto 24px;
+      z-index: 2;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      pointer-events: none;
+    }
+
+    .brand {
+      max-width: min(480px, calc(100vw - 48px));
+      text-shadow: 0 0 24px rgba(107, 211, 255, 0.34);
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: clamp(28px, 5vw, 58px);
+      line-height: 0.95;
+      font-weight: 720;
+      letter-spacing: 0;
+    }
+
+    .brand p {
+      margin: 12px 0 0;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.6;
+    }
+
+    .controls {
+      min-width: 218px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      backdrop-filter: blur(18px);
+      box-shadow: 0 18px 54px rgba(0, 0, 0, 0.28);
+      pointer-events: auto;
+    }
+
+    .control-row {
+      display: grid;
+      grid-template-columns: 72px 1fr;
+      align-items: center;
+      gap: 10px;
+      margin: 0 0 12px;
+    }
+
+    .control-row:last-child {
+      margin-bottom: 0;
+    }
+
+    label {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--cyan);
+    }
+
+    .toggle {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .toggle input {
+      width: 18px;
+      height: 18px;
+      accent-color: var(--gold);
+    }
+
+    .loading {
+      position: fixed;
+      inset: 0;
+      z-index: 3;
+      display: grid;
+      place-items: center;
+      background: #050914;
+      color: rgba(232, 246, 255, 0.86);
+      font-size: 14px;
+      transition: opacity 420ms ease;
+    }
+
+    .loading.is-hidden {
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
+    }
+
+    @media (max-width: 760px) {
+      .hud {
+        inset: 16px 14px auto 14px;
+        flex-direction: column;
+      }
+
+      .brand p {
+        max-width: 330px;
+        font-size: 13px;
+      }
+
+      .controls {
+        width: min(100%, 330px);
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="loading" id="loading">Loading ocean current field...</div>
+  <div class="hud">
+    <div class="brand">
+      <h1>DeerOceanBall</h1>
+      <p>HYCOM surface ocean currents over a luminous map grid. Drag to rotate, scroll to zoom.</p>
+    </div>
+    <div class="controls" aria-label="globe controls">
+      <div class="control-row">
+        <label for="speed">Rotation</label>
+        <input id="speed" type="range" min="0" max="2.8" step="0.05" value="0.78" />
+      </div>
+      <div class="control-row">
+        <label for="density">Current</label>
+        <input id="density" type="range" min="0.35" max="1.8" step="0.05" value="1" />
+      </div>
+      <label class="toggle" for="pulse">
+        <span>Glow</span>
+        <input id="pulse" type="checkbox" checked />
+      </label>
+    </div>
+  </div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://esm.sh/three@0.164.1",
+        "three/addons/": "https://esm.sh/three@0.164.1/examples/jsm/"
+      }
+    }
+  </script>
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+    import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+    import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
+    import { feature } from "https://esm.sh/topojson-client@3.1.0";
+
+    const canvas = document.createElement("canvas");
+    document.body.prepend(canvas);
+
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x050914, 0.018);
+
+    const camera = new THREE.PerspectiveCamera(42, innerWidth / innerHeight, 0.1, 120);
+    camera.position.set(0, 0.15, 8.6);
+
+    const renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: true,
+      alpha: true,
+      powerPreference: "high-performance"
+    });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 1.6));
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.enablePan = false;
+    controls.minDistance = 5.2;
+    controls.maxDistance = 11;
+    controls.rotateSpeed = 0.42;
+
+    const root = new THREE.Group();
+    root.rotation.z = THREE.MathUtils.degToRad(-7);
+    scene.add(root);
+
+    const clock = new THREE.Clock();
+    const uniforms = {
+      uTime: { value: 0 },
+      uEnergy: { value: 1 },
+      uPulse: { value: 1 }
+    };
+
+    const composer = new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene, camera));
+    const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 1.08, 0.7, 0.055);
+    composer.addPass(bloom);
+
+    const palette = [
+      new THREE.Color("#68cfff"),
+      new THREE.Color("#ffcf33"),
+      new THREE.Color("#ff4b26"),
+      new THREE.Color("#ff2db6"),
+      new THREE.Color("#e9ff83")
+    ];
+    const currentStops = [
+      new THREE.Color("#04192f"),
+      new THREE.Color("#075277"),
+      new THREE.Color("#08a0a6"),
+      new THREE.Color("#62e7d4"),
+      new THREE.Color("#e9fff8")
+    ];
+
+    function toSphere(lon, lat, radius) {
+      const phi = THREE.MathUtils.degToRad(90 - lat);
+      const theta = THREE.MathUtils.degToRad(lon + 180);
+      return [
+        -radius * Math.sin(phi) * Math.cos(theta),
+        radius * Math.cos(phi),
+        radius * Math.sin(phi) * Math.sin(theta)
+      ];
+    }
+
+    function makeDiscTexture() {
+      const size = 96;
+      const c = document.createElement("canvas");
+      c.width = size;
+      c.height = size;
+      const ctx = c.getContext("2d");
+      const grad = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+      grad.addColorStop(0, "rgba(255,255,255,1)");
+      grad.addColorStop(0.22, "rgba(255,255,255,0.8)");
+      grad.addColorStop(0.52, "rgba(255,255,255,0.22)");
+      grad.addColorStop(1, "rgba(255,255,255,0)");
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, size, size);
+      return new THREE.CanvasTexture(c);
+    }
+
+    const sprite = makeDiscTexture();
+
+    async function createLandSampler() {
+      const response = await fetch("./assets/countries-110m.json");
+      if (!response.ok) {
+        throw new Error(`Map data failed to load: ${response.status}`);
+      }
+
+      const topology = await response.json();
+      const countries = feature(topology, topology.objects.countries);
+      const width = 2048;
+      const height = 1024;
+      const maskCanvas = document.createElement("canvas");
+      maskCanvas.width = width;
+      maskCanvas.height = height;
+      const ctx = maskCanvas.getContext("2d", { willReadFrequently: true });
+
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = "#fff";
+
+      function project(coord) {
+        const lon = coord[0];
+        const lat = coord[1];
+        return [
+          ((lon + 180) / 360) * width,
+          ((90 - lat) / 180) * height
+        ];
+      }
+
+      function drawRing(ring) {
+        ring.forEach((coord, index) => {
+          const [x, y] = project(coord);
+          if (index === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.closePath();
+      }
+
+      countries.features.forEach((country) => {
+        const polygons = country.geometry.type === "MultiPolygon"
+          ? country.geometry.coordinates
+          : [country.geometry.coordinates];
+
+        polygons.forEach((polygon) => {
+          ctx.beginPath();
+          polygon.forEach(drawRing);
+          ctx.fill("evenodd");
+        });
+      });
+
+      const pixels = ctx.getImageData(0, 0, width, height).data;
+
+      return {
+        edgeStrength(lon, lat) {
+          if (!this.isLand(lon, lat)) return 0;
+          const step = 0.7;
+          const neighbors = [
+            this.isLand(lon + step, lat),
+            this.isLand(lon - step, lat),
+            this.isLand(lon, lat + step),
+            this.isLand(lon, lat - step)
+          ];
+          return neighbors.some((value) => !value) ? 1 : 0;
+        },
+        isLand(lon, lat) {
+          const x = Math.max(0, Math.min(width - 1, Math.round(((lon + 180) / 360) * width)));
+          const y = Math.max(0, Math.min(height - 1, Math.round(((90 - lat) / 180) * height)));
+          return pixels[(y * width + x) * 4 + 3] > 10;
+        }
+      };
+    }
+
+    function pushPoint({ positions, colors, phases, lon, lat, radius, atmosphere, colorMode, isLand }) {
+      const lift = atmosphere ? Math.pow(Math.random(), 1.8) * 0.72 : 0;
+      const p = toSphere(lon, lat, radius + lift);
+      positions.push(p[0], p[1], p[2]);
+
+      let color;
+      if (colorMode === "white") {
+        const v = 0.58 + Math.random() * 0.42;
+        color = new THREE.Color(v, v, v);
+      } else {
+        color = palette[Math.floor(Math.random() * palette.length)].clone();
+        if (isLand && Math.random() > 0.72) color.lerp(new THREE.Color("#ffffff"), 0.28);
+      }
+      colors.push(color.r, color.g, color.b);
+      phases.push(Math.random() * Math.PI * 2);
+    }
+
+    function makePoints({ count, radius, size, landOnly, atmosphere, colorMode, landSampler }) {
+      const positions = [];
+      const colors = [];
+      const phases = [];
+      const sizes = [];
+
+      if (landOnly) {
+        const latStep = 0.68;
+        const lonStep = 0.68;
+        for (let lat = -82; lat <= 84; lat += latStep) {
+          for (let lon = -180; lon <= 180; lon += lonStep) {
+            const jitterLon = lon + (Math.random() - 0.5) * 0.18;
+            const jitterLat = lat + (Math.random() - 0.5) * 0.18;
+            if (!landSampler.isLand(jitterLon, jitterLat)) continue;
+            const edge = landSampler.edgeStrength(jitterLon, jitterLat);
+            if (!edge && Math.random() < 0.1) continue;
+            pushPoint({
+              positions,
+              colors,
+              phases,
+              lon: jitterLon,
+              lat: jitterLat,
+              radius,
+              atmosphere,
+              colorMode,
+              isLand: true
+            });
+            sizes.push(edge ? 1.85 : 1.32);
+          }
+        }
+      } else {
+        let tries = 0;
+        while (positions.length / 3 < count && tries < count * 50) {
+          tries += 1;
+          const lon = -180 + Math.random() * 360;
+          const lat = -74 + Math.random() * 148;
+          const isLand = landSampler.isLand(lon, lat);
+          if (!isLand && Math.random() > 0.08) continue;
+          pushPoint({ positions, colors, phases, lon, lat, radius, atmosphere, colorMode, isLand });
+          sizes.push(1);
+        }
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+      geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+      geometry.setAttribute("aPhase", new THREE.Float32BufferAttribute(phases, 1));
+      geometry.setAttribute("aSize", new THREE.Float32BufferAttribute(sizes, 1));
+
+      const material = new THREE.ShaderMaterial({
+        uniforms: {
+          ...uniforms,
+          uSize: { value: size },
+          uOpacity: { value: colorMode === "white" ? 0.82 : 0.92 }
+        },
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        vertexColors: true,
+        vertexShader: `
+          attribute float aPhase;
+          attribute float aSize;
+          varying vec3 vColor;
+          varying float vAlpha;
+          uniform float uTime;
+          uniform float uSize;
+          uniform float uEnergy;
+          uniform float uPulse;
+          void main() {
+            vColor = color;
+            vec3 p = position;
+            float pulse = 0.72 + 0.34 * sin(uTime * 2.4 + aPhase);
+            vAlpha = mix(0.78, pulse, uPulse);
+            vec4 mvPosition = modelViewMatrix * vec4(p, 1.0);
+            gl_PointSize = uSize * aSize * uEnergy * vAlpha * (390.0 / -mvPosition.z);
+            gl_Position = projectionMatrix * mvPosition;
+          }
+        `,
+        fragmentShader: `
+          varying vec3 vColor;
+          varying float vAlpha;
+          uniform float uOpacity;
+          void main() {
+            vec2 uv = gl_PointCoord - 0.5;
+            float d = length(uv);
+            float core = smoothstep(0.48, 0.0, d);
+            float glow = smoothstep(0.5, 0.05, d) * 0.45;
+            gl_FragColor = vec4(vColor * (core * 1.25 + glow * 2.2), (core + glow * 1.15) * uOpacity * vAlpha);
+          }
+        `
+      });
+
+      return new THREE.Points(geometry, material);
+    }
+
+    async function createCurrentSampler() {
+      const response = await fetch("./assets/ocean-current-surface-hycom.json");
+      if (!response.ok) {
+        throw new Error(`Ocean current data failed to load: ${response.status}`);
+      }
+
+      const records = await response.json();
+      const uRecord = records.find((record) => record.header.parameterNumber === 2);
+      const vRecord = records.find((record) => record.header.parameterNumber === 3);
+      if (!uRecord || !vRecord) {
+        throw new Error("Ocean current data is missing U/V components.");
+      }
+
+      const { nx, ny, lo1, la1, dx, dy } = uRecord.header;
+
+      function valueAt(data, x, y) {
+        const xi = ((x % nx) + nx) % nx;
+        const yi = Math.max(0, Math.min(ny - 1, y));
+        return data[yi * nx + xi];
+      }
+
+      return {
+        meta: {
+          date: records[0].header.refTime,
+          source: records[0].header.source,
+          nx,
+          ny
+        },
+        sample(lon, lat) {
+          const normalizedLon = ((lon - lo1) % 360 + 360) % 360;
+          const x = normalizedLon / dx;
+          const y = (la1 - lat) / Math.abs(dy);
+          const x0 = Math.floor(x);
+          const y0 = Math.floor(y);
+          const x1 = x0 + 1;
+          const y1 = y0 + 1;
+          const tx = x - x0;
+          const ty = y - y0;
+
+          const u00 = valueAt(uRecord.data, x0, y0);
+          const u10 = valueAt(uRecord.data, x1, y0);
+          const u01 = valueAt(uRecord.data, x0, y1);
+          const u11 = valueAt(uRecord.data, x1, y1);
+          const v00 = valueAt(vRecord.data, x0, y0);
+          const v10 = valueAt(vRecord.data, x1, y0);
+          const v01 = valueAt(vRecord.data, x0, y1);
+          const v11 = valueAt(vRecord.data, x1, y1);
+
+          const u0 = THREE.MathUtils.lerp(u00, u10, tx);
+          const u1 = THREE.MathUtils.lerp(u01, u11, tx);
+          const v0 = THREE.MathUtils.lerp(v00, v10, tx);
+          const v1 = THREE.MathUtils.lerp(v01, v11, tx);
+          const u = THREE.MathUtils.lerp(u0, u1, ty);
+          const v = THREE.MathUtils.lerp(v0, v1, ty);
+          return { u, v, speed: Math.hypot(u, v) };
+        }
+      };
+    }
+
+    function currentColor(speed) {
+      const t = THREE.MathUtils.clamp(speed / 1.05, 0, 1);
+      const scaled = t * (currentStops.length - 1);
+      const index = Math.min(currentStops.length - 2, Math.floor(scaled));
+      return currentStops[index].clone().lerp(currentStops[index + 1], scaled - index);
+    }
+
+    function randomCurrentParticle(landSampler, currentSampler, minSpeed = 0.025) {
+      let lon = 0;
+      let lat = 0;
+      for (let tries = 0; tries < 80; tries += 1) {
+        lon = -180 + Math.random() * 360;
+        lat = -78 + Math.random() * 156;
+        if (landSampler.isLand(lon, lat)) continue;
+        if (!currentSampler || currentSampler.sample(lon, lat).speed >= minSpeed) break;
+      }
+      return {
+        lon,
+        lat,
+        age: Math.random(),
+        life: 8.5 + Math.random() * 10.5,
+        radius: 2.765 + Math.random() * 0.08
+      };
+    }
+
+    function makeCurrentParticles({ count, currentSampler, landSampler }) {
+      const trailSteps = 7;
+      const verticesPerParticle = (trailSteps - 1) * 2;
+      const particles = Array.from({ length: count }, () => randomCurrentParticle(landSampler, currentSampler, 0.045));
+      const positions = new Float32Array(count * verticesPerParticle * 3);
+      const colors = new Float32Array(count * verticesPerParticle * 3);
+      const alphas = new Float32Array(count * verticesPerParticle);
+      const phases = new Float32Array(count * verticesPerParticle);
+      const trailLons = new Float32Array(count * trailSteps);
+      const trailLats = new Float32Array(count * trailSteps);
+
+      for (let i = 0; i < count; i += 1) {
+        const phase = Math.random() * Math.PI * 2;
+        for (let vertex = 0; vertex < verticesPerParticle; vertex += 1) {
+          phases[i * verticesPerParticle + vertex] = phase + vertex * 0.18;
+        }
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage));
+      geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3).setUsage(THREE.DynamicDrawUsage));
+      geometry.setAttribute("aAlpha", new THREE.BufferAttribute(alphas, 1).setUsage(THREE.DynamicDrawUsage));
+      geometry.setAttribute("aPhase", new THREE.BufferAttribute(phases, 1));
+
+      const material = new THREE.ShaderMaterial({
+        uniforms: {
+          ...uniforms
+        },
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        vertexColors: true,
+        vertexShader: `
+          attribute float aAlpha;
+          attribute float aPhase;
+          varying vec3 vColor;
+          varying float vAlpha;
+          uniform float uTime;
+          uniform float uEnergy;
+          uniform float uPulse;
+          void main() {
+            vColor = color;
+            float shimmer = 0.82 + 0.22 * sin(uTime * 4.2 + aPhase);
+            vAlpha = aAlpha * uEnergy * mix(1.0, shimmer, uPulse);
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+            gl_Position = projectionMatrix * mvPosition;
+          }
+        `,
+        fragmentShader: `
+          varying vec3 vColor;
+          varying float vAlpha;
+          void main() {
+            gl_FragColor = vec4(vColor * (1.25 + vAlpha * 1.9), vAlpha);
+          }
+        `
+      });
+
+      const points = new THREE.LineSegments(geometry, material);
+
+      function seedTrail(i) {
+        const p = particles[i];
+        const current = currentSampler.sample(p.lon, p.lat);
+        const latCos = Math.max(0.22, Math.cos(THREE.MathUtils.degToRad(p.lat)));
+        for (let step = 0; step < trailSteps; step += 1) {
+          const k = i * trailSteps + step;
+          trailLons[k] = p.lon - current.u * step * 0.55 / latCos;
+          trailLats[k] = THREE.MathUtils.clamp(p.lat - current.v * step * 0.55, -80, 80);
+        }
+      }
+
+      for (let i = 0; i < count; i += 1) {
+        seedTrail(i);
+      }
+
+      function respawn(i) {
+        particles[i] = randomCurrentParticle(landSampler, currentSampler, 0.045);
+        particles[i].age = 0;
+        seedTrail(i);
+      }
+
+      function update(dt) {
+        const pos = geometry.attributes.position.array;
+        const col = geometry.attributes.color.array;
+        const alpha = geometry.attributes.aAlpha.array;
+        const energy = Number(density.value);
+        const flowScale = 1.05 + energy * 0.85;
+
+        for (let i = 0; i < count; i += 1) {
+          const p = particles[i];
+          const current = currentSampler.sample(p.lon, p.lat);
+          const latCos = Math.max(0.22, Math.cos(THREE.MathUtils.degToRad(p.lat)));
+          p.lon += current.u * dt * flowScale / latCos;
+          p.lat += current.v * dt * flowScale;
+          p.age += dt;
+
+          if (p.lon > 180) p.lon -= 360;
+          if (p.lon < -180) p.lon += 360;
+          if (p.lat > 80 || p.lat < -80 || p.age > p.life || current.speed < 0.025 || landSampler.isLand(p.lon, p.lat)) {
+            respawn(i);
+            continue;
+          }
+
+          const trailBase = i * trailSteps;
+          for (let step = trailSteps - 1; step > 0; step -= 1) {
+            trailLons[trailBase + step] = trailLons[trailBase + step - 1];
+            trailLats[trailBase + step] = trailLats[trailBase + step - 1];
+          }
+          trailLons[trailBase] = p.lon;
+          trailLats[trailBase] = p.lat;
+
+          const fadeIn = THREE.MathUtils.smoothstep(p.age, 0, 0.9);
+          const fadeOut = 1 - THREE.MathUtils.smoothstep(p.age, p.life - 1.2, p.life);
+          const a = Math.max(0, Math.min(fadeIn, fadeOut));
+          const lift = Math.min(0.07, current.speed / 20);
+          const color = currentColor(current.speed).multiplyScalar(1.05 + Math.min(current.speed / 1.4, 0.95));
+
+          for (let step = 0; step < trailSteps - 1; step += 1) {
+            const tail = Math.pow(1 - step / (trailSteps - 1), 1.45);
+            const crossesDateLine = Math.abs(trailLons[trailBase + step] - trailLons[trailBase + step + 1]) > 180;
+            const segmentAlpha = crossesDateLine ? 0 : a * tail * (0.22 + Math.min(current.speed / 1.05, 0.88));
+            const xyzA = toSphere(trailLons[trailBase + step], trailLats[trailBase + step], p.radius + lift);
+            const xyzB = toSphere(trailLons[trailBase + step + 1], trailLats[trailBase + step + 1], p.radius + lift * 0.7);
+            const vertexBase = (i * verticesPerParticle + step * 2) * 3;
+            const alphaBase = i * verticesPerParticle + step * 2;
+
+            pos[vertexBase] = xyzA[0];
+            pos[vertexBase + 1] = xyzA[1];
+            pos[vertexBase + 2] = xyzA[2];
+            pos[vertexBase + 3] = xyzB[0];
+            pos[vertexBase + 4] = xyzB[1];
+            pos[vertexBase + 5] = xyzB[2];
+
+            col[vertexBase] = color.r;
+            col[vertexBase + 1] = color.g;
+            col[vertexBase + 2] = color.b;
+            col[vertexBase + 3] = color.r * 0.72;
+            col[vertexBase + 4] = color.g * 0.72;
+            col[vertexBase + 5] = color.b * 0.72;
+            alpha[alphaBase] = segmentAlpha;
+            alpha[alphaBase + 1] = segmentAlpha * 0.48;
+          }
+        }
+
+        geometry.attributes.position.needsUpdate = true;
+        geometry.attributes.color.needsUpdate = true;
+        geometry.attributes.aAlpha.needsUpdate = true;
+      }
+
+      update(0.016);
+      return { points, update, meta: currentSampler.meta };
+    }
+
+    function makeSparkParticles({ count, currentSampler, landSampler }) {
+      const particles = Array.from({ length: count }, () => randomCurrentParticle(landSampler, currentSampler, 0.48));
+      const positions = new Float32Array(count * 3);
+      const colors = new Float32Array(count * 3);
+      const alphas = new Float32Array(count);
+      const phases = new Float32Array(count);
+      const sizes = new Float32Array(count);
+
+      for (let i = 0; i < count; i += 1) {
+        phases[i] = Math.random() * Math.PI * 2;
+        sizes[i] = 1.6 + Math.pow(Math.random(), 2.6) * 3.4;
+        particles[i].life = 1.4 + Math.random() * 2.8;
+        particles[i].radius += 0.02 + Math.random() * 0.12;
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage));
+      geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3).setUsage(THREE.DynamicDrawUsage));
+      geometry.setAttribute("aAlpha", new THREE.BufferAttribute(alphas, 1).setUsage(THREE.DynamicDrawUsage));
+      geometry.setAttribute("aPhase", new THREE.BufferAttribute(phases, 1));
+      geometry.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
+
+      const material = new THREE.ShaderMaterial({
+        uniforms: {
+          ...uniforms,
+          uSize: { value: 0.058 }
+        },
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        vertexColors: true,
+        vertexShader: `
+          attribute float aAlpha;
+          attribute float aPhase;
+          attribute float aSize;
+          varying vec3 vColor;
+          varying float vAlpha;
+          uniform float uTime;
+          uniform float uSize;
+          uniform float uEnergy;
+          uniform float uPulse;
+          void main() {
+            vColor = color;
+            float flicker = 0.72 + 0.42 * sin(uTime * 7.5 + aPhase);
+            vAlpha = aAlpha * mix(1.0, flicker, uPulse);
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+            gl_PointSize = uSize * aSize * uEnergy * (500.0 / -mvPosition.z);
+            gl_Position = projectionMatrix * mvPosition;
+          }
+        `,
+        fragmentShader: `
+          varying vec3 vColor;
+          varying float vAlpha;
+          void main() {
+            vec2 uv = gl_PointCoord - 0.5;
+            float d = length(uv);
+            float core = exp(-d * d * 180.0);
+            float halo = exp(-d * d * 12.0);
+            float edge = smoothstep(0.5, 0.08, d);
+            vec3 rgb = mix(vColor, vec3(0.86, 1.0, 0.98), core * 0.72) * (core * 4.6 + halo * 1.2);
+            gl_FragColor = vec4(rgb, (core + halo * 0.36) * edge * vAlpha);
+          }
+        `
+      });
+
+      const points = new THREE.Points(geometry, material);
+
+      function respawn(i) {
+        particles[i] = randomCurrentParticle(landSampler, currentSampler, 0.48);
+        particles[i].age = 0;
+        particles[i].life = 1.4 + Math.random() * 2.8;
+        particles[i].radius = 2.84 + Math.random() * 0.16;
+      }
+
+      function update(dt) {
+        const pos = geometry.attributes.position.array;
+        const col = geometry.attributes.color.array;
+        const alpha = geometry.attributes.aAlpha.array;
+
+        for (let i = 0; i < count; i += 1) {
+          const p = particles[i];
+          const current = currentSampler.sample(p.lon, p.lat);
+          const latCos = Math.max(0.22, Math.cos(THREE.MathUtils.degToRad(p.lat)));
+          p.lon += current.u * dt * 1.35 / latCos;
+          p.lat += current.v * dt * 1.35;
+          p.age += dt;
+
+          if (p.lon > 180) p.lon -= 360;
+          if (p.lon < -180) p.lon += 360;
+          if (p.lat > 80 || p.lat < -80 || p.age > p.life || current.speed < 0.55 || landSampler.isLand(p.lon, p.lat)) {
+            respawn(i);
+          }
+
+          const fadeIn = THREE.MathUtils.smoothstep(p.age, 0, 0.32);
+          const fadeOut = 1 - THREE.MathUtils.smoothstep(p.age, p.life - 0.58, p.life);
+          const brightness = Math.min(current.speed / 0.78, 1.45);
+          const xyz = toSphere(p.lon, p.lat, p.radius + Math.min(0.08, current.speed / 18));
+          const color = currentColor(current.speed).lerp(new THREE.Color("#eaffff"), Math.min(current.speed / 1.3, 0.58));
+
+          const j = i * 3;
+          pos[j] = xyz[0];
+          pos[j + 1] = xyz[1];
+          pos[j + 2] = xyz[2];
+          col[j] = color.r * 1.22;
+          col[j + 1] = color.g * 1.22;
+          col[j + 2] = color.b * 1.22;
+          alpha[i] = Math.max(0, Math.min(fadeIn, fadeOut)) * brightness;
+        }
+
+        geometry.attributes.position.needsUpdate = true;
+        geometry.attributes.color.needsUpdate = true;
+        geometry.attributes.aAlpha.needsUpdate = true;
+      }
+
+      update(0.016);
+      return { points, update };
+    }
+
+    const haloGeometry = new THREE.SphereGeometry(2.86, 96, 64);
+    const haloMaterial = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.FrontSide,
+      vertexShader: `
+        varying vec3 vWorldNormal;
+        varying vec3 vWorldPosition;
+        void main() {
+          vWorldNormal = normalize(mat3(modelMatrix) * normal);
+          vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+          vWorldPosition = worldPosition.xyz;
+          gl_Position = projectionMatrix * viewMatrix * worldPosition;
+        }
+      `,
+      fragmentShader: `
+        varying vec3 vWorldNormal;
+        varying vec3 vWorldPosition;
+        void main() {
+          vec3 viewDirection = normalize(cameraPosition - vWorldPosition);
+          float fresnel = pow(1.0 - max(dot(normalize(vWorldNormal), viewDirection), 0.0), 4.2);
+          float pole = smoothstep(2.2, 2.86, abs(vWorldPosition.y));
+          vec3 color = mix(vec3(0.16, 0.52, 0.95), vec3(1.0, 0.92, 0.56), pole);
+          gl_FragColor = vec4(color, fresnel * 0.2 + pole * 0.035);
+        }
+      `
+    });
+    root.add(new THREE.Mesh(haloGeometry, haloMaterial));
+
+    function makePolarRings(y) {
+      const group = new THREE.Group();
+      for (let i = 0; i < 34; i += 1) {
+        const radius = 0.34 + i * 0.026;
+        const curve = new THREE.EllipseCurve(0, 0, radius * 1.38, radius, 0, Math.PI * 2);
+        const points = curve.getPoints(164);
+        const geometry = new THREE.BufferGeometry().setFromPoints(points);
+        const material = new THREE.LineBasicMaterial({
+          color: i % 3 === 0 ? 0xfff1bb : 0xffffff,
+          transparent: true,
+          opacity: 0.014 + i * 0.0028,
+          blending: THREE.AdditiveBlending
+        });
+        const line = new THREE.LineLoop(geometry, material);
+        line.rotation.x = Math.PI / 2;
+        line.position.y = y;
+        group.add(line);
+      }
+      return group;
+    }
+
+    root.add(makePolarRings(2.5));
+    root.add(makePolarRings(-2.5));
+
+    const starGeometry = new THREE.BufferGeometry();
+    const starPositions = [];
+    const starColors = [];
+    for (let i = 0; i < 1100; i += 1) {
+      const r = 12 + Math.random() * 36;
+      const theta = Math.random() * Math.PI * 2;
+      const phi = Math.acos(2 * Math.random() - 1);
+      starPositions.push(
+        r * Math.sin(phi) * Math.cos(theta),
+        r * Math.cos(phi),
+        r * Math.sin(phi) * Math.sin(theta)
+      );
+      const c = palette[Math.floor(Math.random() * palette.length)].clone().lerp(new THREE.Color("#ffffff"), 0.45);
+      starColors.push(c.r, c.g, c.b);
+    }
+    starGeometry.setAttribute("position", new THREE.Float32BufferAttribute(starPositions, 3));
+    starGeometry.setAttribute("color", new THREE.Float32BufferAttribute(starColors, 3));
+    const stars = new THREE.Points(
+      starGeometry,
+      new THREE.PointsMaterial({
+        size: 0.035,
+        map: sprite,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.7,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending
+      })
+    );
+    scene.add(stars);
+
+    const speed = document.getElementById("speed");
+    const density = document.getElementById("density");
+    const pulse = document.getElementById("pulse");
+    let currentLayer;
+    let sparkLayer;
+
+    function resize() {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+      composer.setSize(innerWidth, innerHeight);
+      bloom.setSize(innerWidth, innerHeight);
+    }
+    addEventListener("resize", resize);
+
+    function animate() {
+      const dt = Math.min(clock.getDelta(), 0.04);
+      const elapsed = clock.elapsedTime;
+      uniforms.uTime.value = elapsed;
+      uniforms.uEnergy.value = Number(density.value);
+      uniforms.uPulse.value = pulse.checked ? 1 : 0;
+
+      root.rotation.y += 0.0024 * Number(speed.value);
+      if (currentLayer) currentLayer.update(dt);
+      if (sparkLayer) sparkLayer.update(dt);
+      stars.rotation.y -= 0.00008;
+      stars.rotation.x += 0.00004;
+      controls.update();
+      composer.render();
+      requestAnimationFrame(animate);
+    }
+
+    async function init() {
+      const [landSampler, currentSampler] = await Promise.all([
+        createLandSampler(),
+        createCurrentSampler()
+      ]);
+
+      const earthPoints = makePoints({
+        count: 0,
+        radius: 2.725,
+        size: 0.038,
+        landOnly: true,
+        atmosphere: false,
+        colorMode: "white",
+        landSampler
+      });
+      root.add(earthPoints);
+
+      currentLayer = makeCurrentParticles({
+        count: 7600,
+        currentSampler,
+        landSampler
+      });
+      root.add(currentLayer.points);
+
+      sparkLayer = makeSparkParticles({
+        count: 900,
+        currentSampler,
+        landSampler
+      });
+      root.add(sparkLayer.points);
+      window.__BEGLOBE_DEBUG__ = {
+        currentMeta: currentLayer.meta,
+        currentParticleCount: currentLayer.points.geometry.attributes.position.count,
+        firstCurrentPoint() {
+          const p = currentLayer.points.geometry.attributes.position.array;
+          return [p[0], p[1], p[2]];
+        }
+      };
+
+      document.getElementById("loading").classList.add("is-hidden");
+      animate();
+    }
+
+    init().catch((error) => {
+      document.getElementById("loading").textContent = error.message;
+      console.error(error);
+    });
+  </script>
+</body>
+</html>
