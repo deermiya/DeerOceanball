@@ -517,6 +517,134 @@
       };
     }
 
+    function makeDepthLayer({ count, radius, pointSize, speedMul, opacity, minSpeed, currentSampler, landSampler }) {
+      const particles = Array.from({ length: count }, () => {
+        const p = randomCurrentParticle(landSampler, currentSampler, minSpeed);
+        p.radius = radius + Math.random() * 0.02;
+        p.life = THREE.MathUtils.clamp(22 / (currentSampler.sample(p.lon, p.lat).speed + 0.2), 6, 32);
+        return p;
+      });
+
+      const positions = new Float32Array(count * 3);
+      const colors = new Float32Array(count * 3);
+      const alphas = new Float32Array(count);
+      const phases = new Float32Array(count);
+      const sizes = new Float32Array(count);
+
+      for (let i = 0; i < count; i++) {
+        phases[i] = Math.random() * Math.PI * 2;
+        sizes[i] = 0.7 + Math.random() * 0.6;
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage));
+      geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3).setUsage(THREE.DynamicDrawUsage));
+      geometry.setAttribute("aAlpha", new THREE.BufferAttribute(alphas, 1).setUsage(THREE.DynamicDrawUsage));
+      geometry.setAttribute("aPhase", new THREE.BufferAttribute(phases, 1));
+      geometry.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
+
+      const material = new THREE.ShaderMaterial({
+        uniforms: {
+          ...uniforms,
+          uSize: { value: pointSize },
+          uOpacity: { value: opacity }
+        },
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        vertexColors: true,
+        vertexShader: `
+          attribute float aAlpha;
+          attribute float aPhase;
+          attribute float aSize;
+          varying vec3 vColor;
+          varying float vAlpha;
+          uniform float uTime;
+          uniform float uSize;
+          uniform float uEnergy;
+          uniform float uPulse;
+          uniform float uOpacity;
+          void main() {
+            vColor = color;
+            float shimmer = 0.88 + 0.14 * sin(uTime * 2.8 + aPhase);
+            vAlpha = aAlpha * uOpacity * uEnergy * mix(1.0, shimmer, uPulse);
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+            gl_PointSize = uSize * aSize * uEnergy * (380.0 / -mvPosition.z);
+            gl_Position = projectionMatrix * mvPosition;
+          }
+        `,
+        fragmentShader: `
+          varying vec3 vColor;
+          varying float vAlpha;
+          void main() {
+            vec2 uv = gl_PointCoord - 0.5;
+            float d = length(uv);
+            float core = smoothstep(0.45, 0.0, d);
+            float glow = smoothstep(0.5, 0.05, d) * 0.4;
+            gl_FragColor = vec4(vColor * (core * 1.15 + glow * 1.8), (core + glow) * vAlpha);
+          }
+        `
+      });
+
+      const points = new THREE.Points(geometry, material);
+
+      function respawn(i) {
+        particles[i] = randomCurrentParticle(landSampler, currentSampler, minSpeed);
+        particles[i].radius = radius + Math.random() * 0.02;
+        particles[i].age = 0;
+        const speed = currentSampler.sample(particles[i].lon, particles[i].lat).speed;
+        particles[i].life = THREE.MathUtils.clamp(22 / (speed + 0.2), 6, 32);
+      }
+
+      function update(dt) {
+        const pos = geometry.attributes.position.array;
+        const col = geometry.attributes.color.array;
+        const alpha = geometry.attributes.aAlpha.array;
+        const energy = Number(density.value);
+        const flowScale = 1.05 + energy * 0.85;
+
+        for (let i = 0; i < count; i++) {
+          const p = particles[i];
+          const current = currentSampler.sample(p.lon, p.lat);
+          const latCos = Math.max(0.22, Math.cos(THREE.MathUtils.degToRad(p.lat)));
+          p.lon += current.u * dt * flowScale * speedMul / latCos;
+          p.lat += current.v * dt * flowScale * speedMul;
+          p.age += dt;
+
+          if (p.lon > 180) p.lon -= 360;
+          if (p.lon < -180) p.lon += 360;
+          if (p.lat > 80 || p.lat < -80 || p.age > p.life || landSampler.isLand(p.lon, p.lat)) {
+            respawn(i);
+            continue;
+          }
+
+          const fadeIn = THREE.MathUtils.smoothstep(p.age, 0, 1.5);
+          const fadeOut = 1 - THREE.MathUtils.smoothstep(p.age, p.life - 2, p.life);
+          const a = Math.max(0, Math.min(fadeIn, fadeOut));
+          const speed = current.speed;
+          const lift = Math.min(0.06, speed / 20);
+          const color = currentColor(speed).multiplyScalar(0.7 + Math.min(speed / 1.6, 0.6));
+          const xyz = toSphere(p.lon, p.lat, p.radius + lift);
+
+          const j = i * 3;
+          pos[j] = xyz[0];
+          pos[j + 1] = xyz[1];
+          pos[j + 2] = xyz[2];
+          col[j] = color.r;
+          col[j + 1] = color.g;
+          col[j + 2] = color.b;
+          alpha[i] = a;
+        }
+
+        geometry.attributes.position.needsUpdate = true;
+        geometry.attributes.color.needsUpdate = true;
+        geometry.attributes.aAlpha.needsUpdate = true;
+      }
+
+      update(0.016);
+      return { points, update };
+    }
+
     function currentColor(speed) {
       const t = THREE.MathUtils.clamp(speed / 1.05, 0, 1);
       const scaled = t * (currentStops.length - 1);
@@ -543,7 +671,44 @@
     }
 
     function makeCurrentParticles({ count, currentSampler, landSampler }) {
-      const trailSteps = 7;
+      // --- 2D Simplex noise (compact) for curl turbulence ---
+      const F2 = 0.5 * (Math.sqrt(3) - 1);
+      const G2 = (3 - Math.sqrt(3)) / 6;
+      const grad2 = [[1,1],[-1,1],[1,-1],[-1,-1],[1,0],[-1,0],[0,1],[0,-1]];
+      const perm = new Uint8Array(512);
+      const simplex = new Uint8Array(512);
+      for (let i = 0; i < 256; i++) { perm[i] = i; }
+      for (let i = 255; i > 0; i--) { const j = (Math.random() * (i + 1)) | 0; [perm[i], perm[j]] = [perm[j], perm[i]]; }
+      for (let i = 0; i < 256; i++) { perm[i + 256] = perm[i]; simplex[i] = simplex[i + 256] = i % 3; }
+
+      function dot2(g, x, y) { return g[0] * x + g[1] * y; }
+      function noise2D(xin, yin) {
+        let n0, n1, n2;
+        const s = (xin + yin) * F2;
+        const i = Math.floor(xin + s), j = Math.floor(yin + s);
+        const t = (i + j) * G2;
+        const x0 = xin - (i - t), y0 = yin - (j - t);
+        const i1 = x0 > y0 ? 1 : 0, j1 = x0 > y0 ? 0 : 1;
+        const x1 = x0 - i1 + G2, y1 = y0 - j1 + G2;
+        const x2 = x0 - 1 + 2 * G2, y2 = y0 - 1 + 2 * G2;
+        const ii = i & 255, jj = j & 255;
+        let t0 = 0.5 - x0 * x0 - y0 * y0;
+        n0 = t0 < 0 ? 0 : (t0 *= t0, t0 * t0 * dot2(grad2[perm[ii + simplex[jj]] % 8], x0, y0));
+        let t1 = 0.5 - x1 * x1 - y1 * y1;
+        n1 = t1 < 0 ? 0 : (t1 *= t1, t1 * t1 * dot2(grad2[perm[ii + i1 + simplex[jj + j1]] % 8], x1, y1));
+        let t2 = 0.5 - x2 * x2 - y2 * y2;
+        n2 = t2 < 0 ? 0 : (t2 *= t2, t2 * t2 * dot2(grad2[perm[ii + 1 + simplex[jj + 1]] % 8], x2, y2));
+        return 70 * (n0 + n1 + n2);
+      }
+      function curlNoise(x, y) {
+        const e = 0.01;
+        const dx = (noise2D(x + e, y) - noise2D(x - e, y)) / (2 * e);
+        const dy = (noise2D(x, y + e) - noise2D(x, y - e)) / (2 * e);
+        return { u: dy, v: -dx };
+      }
+
+      // --- Trail buffer setup ---
+      const trailSteps = 16;
       const verticesPerParticle = (trailSteps - 1) * 2;
       const particles = Array.from({ length: count }, () => randomCurrentParticle(landSampler, currentSampler, 0.045));
       const positions = new Float32Array(count * verticesPerParticle * 3);
@@ -584,7 +749,7 @@
           uniform float uPulse;
           void main() {
             vColor = color;
-            float shimmer = 0.82 + 0.22 * sin(uTime * 4.2 + aPhase);
+            float shimmer = 0.85 + 0.18 * sin(uTime * 3.6 + aPhase);
             vAlpha = aAlpha * uEnergy * mix(1.0, shimmer, uPulse);
             vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
             gl_Position = projectionMatrix * mvPosition;
@@ -594,32 +759,44 @@
           varying vec3 vColor;
           varying float vAlpha;
           void main() {
-            gl_FragColor = vec4(vColor * (1.25 + vAlpha * 1.9), vAlpha);
+            gl_FragColor = vec4(vColor * (1.3 + vAlpha * 1.8), vAlpha);
           }
         `
       });
 
       const points = new THREE.LineSegments(geometry, material);
+      const turbScale = 0.012;
+      const subSteps = 6;
 
-      function seedTrail(i) {
+      function initTrail(i) {
         const p = particles[i];
-        const current = currentSampler.sample(p.lon, p.lat);
         const latCos = Math.max(0.22, Math.cos(THREE.MathUtils.degToRad(p.lat)));
-        for (let step = 0; step < trailSteps; step += 1) {
-          const k = i * trailSteps + step;
-          trailLons[k] = p.lon - current.u * step * 0.55 / latCos;
-          trailLats[k] = THREE.MathUtils.clamp(p.lat - current.v * step * 0.55, -80, 80);
+        const cur = currentSampler.sample(p.lon, p.lat);
+        for (let s = 0; s < trailSteps; s += 1) {
+          const k = i * trailSteps + s;
+          trailLons[k] = p.lon - cur.u * s * 0.35 / latCos;
+          trailLats[k] = THREE.MathUtils.clamp(p.lat - cur.v * s * 0.35, -80, 80);
         }
       }
 
       for (let i = 0; i < count; i += 1) {
-        seedTrail(i);
+        initTrail(i);
       }
 
       function respawn(i) {
         particles[i] = randomCurrentParticle(landSampler, currentSampler, 0.045);
-        particles[i].age = 0;
-        seedTrail(i);
+        const p = particles[i];
+        const speed = currentSampler.sample(p.lon, p.lat).speed;
+        p.life = THREE.MathUtils.clamp(18 / (speed + 0.3), 4, 28);
+        p.age = 0;
+        initTrail(i);
+      }
+
+      // Set initial lifetimes
+      for (let i = 0; i < count; i += 1) {
+        const p = particles[i];
+        const speed = currentSampler.sample(p.lon, p.lat).speed;
+        p.life = THREE.MathUtils.clamp(18 / (speed + 0.3), 4, 28);
       }
 
       function update(dt) {
@@ -628,44 +805,61 @@
         const alpha = geometry.attributes.aAlpha.array;
         const energy = Number(density.value);
         const flowScale = 1.05 + energy * 0.85;
+        const turbStrength = 0.04 + energy * 0.11;
+        const elapsed = clock.elapsedTime;
 
         for (let i = 0; i < count; i += 1) {
           const p = particles[i];
-          const current = currentSampler.sample(p.lon, p.lat);
-          const latCos = Math.max(0.22, Math.cos(THREE.MathUtils.degToRad(p.lat)));
-          p.lon += current.u * dt * flowScale / latCos;
-          p.lat += current.v * dt * flowScale;
-          p.age += dt;
+          const subDt = dt / subSteps;
 
+          for (let s = 0; s < subSteps; s += 1) {
+            const current = currentSampler.sample(p.lon, p.lat);
+            const latCos = Math.max(0.22, Math.cos(THREE.MathUtils.degToRad(p.lat)));
+            const curl = curlNoise(p.lon * turbScale, p.lat * turbScale);
+            p.lon += (current.u + curl.u * turbStrength) * subDt * flowScale / latCos;
+            p.lat += (current.v + curl.v * turbStrength) * subDt * flowScale;
+          }
+
+          p.age += dt;
           if (p.lon > 180) p.lon -= 360;
           if (p.lon < -180) p.lon += 360;
+
+          const current = currentSampler.sample(p.lon, p.lat);
           if (p.lat > 80 || p.lat < -80 || p.age > p.life || current.speed < 0.025 || landSampler.isLand(p.lon, p.lat)) {
             respawn(i);
             continue;
           }
 
           const trailBase = i * trailSteps;
-          for (let step = trailSteps - 1; step > 0; step -= 1) {
-            trailLons[trailBase + step] = trailLons[trailBase + step - 1];
-            trailLats[trailBase + step] = trailLats[trailBase + step - 1];
+          for (let s = trailSteps - 1; s > 0; s -= 1) {
+            trailLons[trailBase + s] = trailLons[trailBase + s - 1];
+            trailLats[trailBase + s] = trailLats[trailBase + s - 1];
           }
           trailLons[trailBase] = p.lon;
           trailLats[trailBase] = p.lat;
 
-          const fadeIn = THREE.MathUtils.smoothstep(p.age, 0, 0.9);
-          const fadeOut = 1 - THREE.MathUtils.smoothstep(p.age, p.life - 1.2, p.life);
+          const fadeIn = THREE.MathUtils.smoothstep(p.age, 0, 1.2);
+          const fadeOut = 1 - THREE.MathUtils.smoothstep(p.age, p.life - 1.8, p.life);
           const a = Math.max(0, Math.min(fadeIn, fadeOut));
-          const lift = Math.min(0.07, current.speed / 20);
-          const color = currentColor(current.speed).multiplyScalar(1.05 + Math.min(current.speed / 1.4, 0.95));
+          const speed = current.speed;
+          const lift = Math.min(0.08, speed / 18);
+          const color = currentColor(speed);
+          const bright = 1.1 + Math.min(speed / 1.2, 1.0);
+          color.multiplyScalar(bright);
 
-          for (let step = 0; step < trailSteps - 1; step += 1) {
-            const tail = Math.pow(1 - step / (trailSteps - 1), 1.45);
-            const crossesDateLine = Math.abs(trailLons[trailBase + step] - trailLons[trailBase + step + 1]) > 180;
-            const segmentAlpha = crossesDateLine ? 0 : a * tail * (0.22 + Math.min(current.speed / 1.05, 0.88));
-            const xyzA = toSphere(trailLons[trailBase + step], trailLats[trailBase + step], p.radius + lift);
-            const xyzB = toSphere(trailLons[trailBase + step + 1], trailLats[trailBase + step + 1], p.radius + lift * 0.7);
-            const vertexBase = (i * verticesPerParticle + step * 2) * 3;
-            const alphaBase = i * verticesPerParticle + step * 2;
+          for (let s = 0; s < trailSteps - 1; s += 1) {
+            const t = s / (trailSteps - 1);
+            const tail = Math.pow(1 - t, 1.8);
+            const lonA = trailLons[trailBase + s];
+            const lonB = trailLons[trailBase + s + 1];
+            const crossesDateLine = Math.abs(lonA - lonB) > 180;
+            const speedFactor = 0.3 + Math.min(speed / 0.85, 0.95);
+            const segmentAlpha = crossesDateLine ? 0 : a * tail * speedFactor;
+            const liftA = lift * (1 - t * 0.3);
+            const xyzA = toSphere(lonA, trailLats[trailBase + s], p.radius + liftA);
+            const xyzB = toSphere(lonB, trailLats[trailBase + s + 1], p.radius + liftA * 0.7);
+            const vertexBase = (i * verticesPerParticle + s * 2) * 3;
+            const alphaBase = i * verticesPerParticle + s * 2;
 
             pos[vertexBase] = xyzA[0];
             pos[vertexBase + 1] = xyzA[1];
@@ -674,14 +868,15 @@
             pos[vertexBase + 4] = xyzB[1];
             pos[vertexBase + 5] = xyzB[2];
 
-            col[vertexBase] = color.r;
-            col[vertexBase + 1] = color.g;
-            col[vertexBase + 2] = color.b;
-            col[vertexBase + 3] = color.r * 0.72;
-            col[vertexBase + 4] = color.g * 0.72;
-            col[vertexBase + 5] = color.b * 0.72;
+            const colorFade = 0.6 + 0.4 * (1 - t);
+            col[vertexBase] = color.r * colorFade;
+            col[vertexBase + 1] = color.g * colorFade;
+            col[vertexBase + 2] = color.b * colorFade;
+            col[vertexBase + 3] = color.r * colorFade * 0.65;
+            col[vertexBase + 4] = color.g * colorFade * 0.65;
+            col[vertexBase + 5] = color.b * colorFade * 0.65;
             alpha[alphaBase] = segmentAlpha;
-            alpha[alphaBase + 1] = segmentAlpha * 0.48;
+            alpha[alphaBase + 1] = segmentAlpha * 0.42;
           }
         }
 
@@ -902,6 +1097,7 @@
     const pulse = document.getElementById("pulse");
     let currentLayer;
     let sparkLayer;
+    let depthLayers = [];
 
     function resize() {
       camera.aspect = innerWidth / innerHeight;
@@ -922,6 +1118,7 @@
       root.rotation.y += 0.0024 * Number(speed.value);
       if (currentLayer) currentLayer.update(dt);
       if (sparkLayer) sparkLayer.update(dt);
+      for (const layer of depthLayers) layer.update(dt);
       stars.rotation.y -= 0.00008;
       stars.rotation.x += 0.00004;
       controls.update();
@@ -946,6 +1143,19 @@
       });
       root.add(earthPoints);
 
+      const deepLayer = makeDepthLayer({
+        count: 4000,
+        radius: 2.735,
+        pointSize: 0.022,
+        speedMul: 0.35,
+        opacity: 0.38,
+        minSpeed: 0.015,
+        currentSampler,
+        landSampler
+      });
+      root.add(deepLayer.points);
+      depthLayers.push(deepLayer);
+
       currentLayer = makeCurrentParticles({
         count: 7600,
         currentSampler,
@@ -959,6 +1169,20 @@
         landSampler
       });
       root.add(sparkLayer.points);
+
+      const surfaceLayer = makeDepthLayer({
+        count: 2000,
+        radius: 2.84,
+        pointSize: 0.065,
+        speedMul: 1.8,
+        opacity: 0.52,
+        minSpeed: 0.35,
+        currentSampler,
+        landSampler
+      });
+      root.add(surfaceLayer.points);
+      depthLayers.push(surfaceLayer);
+
       window.__BEGLOBE_DEBUG__ = {
         currentMeta: currentLayer.meta,
         currentParticleCount: currentLayer.points.geometry.attributes.position.count,
